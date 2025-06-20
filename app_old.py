@@ -19,6 +19,8 @@ from typing import Optional
 from fastapi import HTTPException
 from fastapi.openapi.models import Parameter
 from fastapi.openapi.utils import get_openapi
+import anthropic
+
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +69,7 @@ CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 
 # Directories
 TOKEN_STORAGE_DIR = "user_tokens"
@@ -265,6 +268,7 @@ def parse_user_prompt(
         )
 
 
+
 def generate_post_content(description: str, link: Optional[str] = None) -> str:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key missing.")
@@ -281,19 +285,47 @@ def generate_post_content(description: str, link: Optional[str] = None) -> str:
             print(f"Error fetching content from {link}: {e}")
             content = description
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {
-                    "role": "user",
-                    "content": f"Create a LinkedIn post based on this: {content}. Include a CTA and 1-3 hashtags. If a URL was provided, include it in the post text.",
-                },
-            ],
-            temperature=0.7,
-        )
-        post_text = response.choices[0].message.content.strip()
+        # client = OpenAI(api_key=OPENAI_API_KEY)
+        # response = client.chat.completions.create(
+        #     model="gpt-4o",
+        #     messages=[
+        #         {"role": "system", "content": "You are a helpful assistant."},
+        #         {
+        #             "role": "user",
+        #             "content": f"Create a LinkedIn post based on this: {content}. Include a CTA and 1-3 hashtags. If a URL was provided, include it in the post text.",
+        #         },
+        #     ],
+        #     temperature=0.7,
+        # )
+        # post_text = response.choices[0].message.content.strip()
+        
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        
+        response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Create a LinkedIn post based on this: {content}. Include a CTA and 1-3 hashtags. If a URL was provided, include it in the post text. dont add any extra lines or words just linkedin perfect post ready to post"
+                    }
+                ],
+                tools=[{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5
+                }]
+            )
+        
+        print(response)
+        post_text = ""
+        for block in response.content:
+            if block.type == "text":  # Only process TextBlock entries
+                post_text += block.text
+
+        # Remove the optimization explanation (if present) and clean up
+        # post_text = post_text.split("This post is optimized for virality because")[0].strip()
+        # post_text = response.content[0].text.strip()
         if link and link not in post_text:
             post_text += f"\n\nCheck it out: {link}"
         return post_text
