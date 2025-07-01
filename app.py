@@ -18,7 +18,11 @@ import json
 from typing import Optional
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
+import anthropic
+import boto3
+import json
+from botocore.exceptions import ClientError
+from fastapi import HTTPException
 # Load environment variables
 load_dotenv()
 
@@ -43,7 +47,8 @@ CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 # Directories
 TOKEN_STORAGE_DIR = "user_tokens"
 SCHEDULED_POSTS_FILE = "scheduled_posts.json"
@@ -77,7 +82,10 @@ states = {}
 # --- Pydantic Models ---
 class PostContent(BaseModel):
     text: str
-
+class GeneratedPost(BaseModel):
+    text: str
+    image_path: Optional[str] = None
+    url: Optional[str] = None
 
 class ArticleContent(BaseModel):
     text: str
@@ -95,6 +103,34 @@ class ScheduledPost(BaseModel):
     url: Optional[HttpUrl] = None
     timestamp: str
 
+async def identify_intent_with_gpt(prompt: str) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Classify the user's intent as one of the following: 'linkedin','linkedin_no_topic' or 'chat'.\n"
+                "Return only one word: 'linkedin_no_topic', 'linkedin', or 'chat'.\n\n"
+                "Criteria: please critically analyze between linkedin, linkedin_no_topic\n"
+                "- 'linkedin' if the user is trying to **write or post** something on LinkedIn/ even if user mention post it means LinkedIn post, including professional congratulations, announcements, achievements, or networking posts etc. Topic could be about any company or AI or any thing if mentioned\n"
+                "- 'linkedin_no_topic' if the user is trying to **write or post** something on LinkedIn/ even if user mention post it means LinkedIn post, but there is no topic of post in there. Topic could be about any company or AI or any thing if not mentioned\n"
+                "- 'chat' if it's a casual conversation or unrelated to finances or LinkedIn."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        res = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=50,
+        )
+        content = res.choices[0].message.content.strip().lower()
+        return content if content in ["linkedin", "chat", "linkedin_no_topic"] else "chat"
+    except Exception as e:
+        return "chat"
+    
+    
+
 
 # --- Helper Functions ---
 def save_user_credentials(user_id: str, credentials: dict):
@@ -109,6 +145,98 @@ def save_user_credentials(user_id: str, credentials: dict):
             status_code=500, detail=f"Failed to save user credentials: {e}"
         )
 
+
+def get_news_result(q: str):
+    if not SERPAPI_KEY:
+        return {"error": "SerpAPI key is missing or not set in .env file."}
+
+    params = {
+        "engine": "google_news",
+        "q": q,
+        "hl": "en",
+        "gl": "us",
+        "api_key": SERPAPI_KEY
+    }
+
+    response = requests.get("https://serpapi.com/search", params=params)
+    data = response.json()
+
+    news_results = data.get("news_results", [])
+    if not news_results:
+        return {"found": False, "message": "No news results found."}
+
+    links = [news.get("link") for news in news_results if news.get("link")]
+    return {
+        "found": bool(links),
+        "links": links
+    }
+
+
+
+def should_search_google(prompt: str) -> bool:
+    system_msg = (
+        "You are a smart classifier that decides if a user's prompt needs a Google search.\n"
+        "Only return 'yes' if the prompt requires up-to-date or external information, "
+        "like news, pricing, tools, local services, or live data. Return 'no' otherwise."
+    )
+
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1,
+        temperature=0
+    )
+
+    result = response.choices[0].message.content.strip()
+    return result == "yes"
+
+
+def get_cleaned_search_text(prompt: str) -> dict:
+    # Step 1: Ask GPT whether it needs Google search
+    system_check = (
+        "You are a smart classifier that decides if a user's prompt needs a Google search.\n"
+        "Only return 'yes' if the prompt requires up-to-date or external information, "
+        "like news, pricing, tools, local services, or live data. Return 'no' otherwise."
+    )
+    check_response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_check},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1,
+        temperature=0
+    )
+    needs_search = check_response.choices[0].message.content.strip().lower() == "yes"
+
+    if not needs_search:
+        return {"should_search": False, "search_text": None}
+
+    # Step 2: Clean prompt (remove links and irrelevant phrases)
+    system_extract = (
+        "You are a helpful assistant. From the user's message, extract only the relevant keywords or search query "
+        "they would type into Google. Ignore any personal references, links, or platform-specific actions like "
+        "'post on LinkedIn'. Return only the cleaned search query."
+    )
+    cleaned_response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_extract},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=50,
+        temperature=0.3
+    )
+
+    cleaned_text = cleaned_response.choices[0].message.content.strip()
+
+    return {
+        "should_search": True,
+        "search_text": cleaned_text
+    }
 
 def load_user_credentials(user_id: str) -> dict | None:
     file_path = os.path.join(TOKEN_STORAGE_DIR, f"{user_id}.json")
@@ -191,7 +319,7 @@ def parse_user_prompt(
                     "role": "system",
                     "content": (
                         "You are a JSON-only parser. "
-                        "Parse a prompt related to scheduling LinkedIn posts. "
+                        "Parse a prompt related to scheduling LinkedIn posts. if there is no content related to linkedin just make des and post text as same as prompt "
                         "Return this exact JSON format:\n"
                         "{"
                         '"num_posts": int, '
@@ -233,66 +361,159 @@ def parse_user_prompt(
         )
 
 
-def generate_post_content(description: str, link: Optional[HttpUrl] = None) -> str:
+def generate_post_content(description: str, link: Optional[str] = None, limit_links : Optional[int] = 5) -> str:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key missing.")
     openai.api_key = OPENAI_API_KEY
     content = description
+    res = get_cleaned_search_text(description)
+    if res.get("should_search", False):
+        data = get_news_result(res.get("search_text", ""))
+        link = data.get("links")
     if link:
-        try:
-            response = requests.get(link)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            content = soup.get_text(separator=" ", strip=True)[:1000]
-            print("BeautifulSoup content fetched successfully.", content[:100])
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching content from {link}: {e}")
-            content = description
+        fetched_content = []
+        for i, url in enumerate(link[:limit_links]):  # Process first 5 links
+            try:
+                response = requests.get(url)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "html.parser")
+                content = soup.get_text(separator=" ", strip=True)[:1000]
+                print(f"Fetched content from {url}: {content[:100]}...")  # Log first 100 chars
+                fetched_content.append(content)
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching content from {url}: {e}")
+                fetched_content.append(description)
+        content = " ".join(fetched_content)  # Combine content from all fetched links
+    # try:
+        # client = OpenAI(api_key=OPENAI_API_KEY)
+        # response = client.chat.completions.create(
+        #     model="gpt-4o",
+        #     messages=[
+        #         {"role": "system", "content": "You are a helpful assistant."},
+        #         {
+        #             "role": "user",
+        #             "content": f"Create a LinkedIn post based on this: {content}. Include a CTA and 1-3 hashtags. If a URL was provided, include it in the post text.",
+        #         },
+        #     ],
+        #     temperature=0.7,
+        # )
+        # post_text = response.choices[0].message.content.strip()
+
+
     try:
-        print("starting CHATGPT")
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
+        # Initialize Bedrock client using credentials from .env
+        client = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=os.getenv('AWS_DEFAULT_REGION'),
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+        )
+        
+        
+        # Prepare the prompt for DeepSeek model
+        prompt = f"""You are an expert LinkedIn content creator. Your goal is to create a viral LinkedIn post based on the provided content.
+Analyze the following content and transform it into a compelling LinkedIn post that is optimized for maximum engagement and virality.
+
+**Content to Summarize:**
+{content}
+
+**Instructions for the LinkedIn Post:**
+
+**1. Persona:** Adopt a good and insightful persona. Be a thought leader in your field.
+
+**2. Opening Hook (1-2 lines):**
+*   Craft a highly engaging and diverse opening hook. This could be:
+    *   A bold, provocative statement.
+    *   A surprising statistic or little-known fact.
+    *   A compelling question that sparks immediate curiosity.
+    *   A short, impactful anecdote (if applicable).
+*   Ensure it immediately grabs attention and sets the stage for the content.
+*   Examples:
+    *   "Forget what you thought you knew about [industry]..."
+    *   "The single biggest challenge facing [topic] isn't what you think."
+    *   "What if [common belief] is completely wrong?"
+    *   "A quiet revolution is brewing in [sector]..."
+
+**3. Body (4-6 lines):**
+*   Distill the most important and impactful insights from the provided text.
+*   Use bullet points or numbered lists for easy scanning.
+*   Include at least three specific, meaningful details from the content. For each detail, cite the source clearly (e.g., "(Source: Forbes)").
+*   Add a personal touch or a unique perspective. Share a lesson learned, a prediction, or a solution-oriented opinion that goes beyond summarizing the content. Make it truly *your* take.
+
+**4. Call to Action (1-2 lines):**
+*   End with a question or a call to action that encourages comments and discussion. For example, ask "What are your thoughts on this? I'd love to hear your perspective in the comments." or "Has anyone else experienced something similar? Share your story below." or "What do you think is the next big trend in [topic]?"
+
+**5. Hashtags:**
+*   Include 3-5 relevant and trending hashtags to increase visibility.
+
+**6. Formatting:**
+*   Use short paragraphs (2-3 sentences).
+*   Incorporate emojis strategically throughout the post to add visual interest and convey tone. Aim for 3-5 emojis beyond the opening hook.
+
+**7. Tone:**
+*   The tone of the post should be good.
+
+**8. Sources:**
+*   Integrate sources naturally within the text where appropriate (e.g., "According to a recent report by [Source Name], [data point]").
+*   List all sources cited in the post at the very end, with full URLs, each on a new line, prefixed with a bullet point (e.g., "• Source: URL").
+
+Please generate a LinkedIn post that follows all of these instructions to create a piece of content that is ready to be shared and is optimized for virality.
+DO NOT add any extra lines or words just linkedin perfect post ready to post AT ALL [Just pure LinkedIn Post]. STRICTLY PROHIBETED TO ADD ANY OTHER RESPONSE BESIDE ORIGINAL POST, LIKE 'HERE IS YOUR RESPONSE'"""
+
+        # Invoke the DeepSeek model
+        response = client.invoke_model(
+            modelId = "arn:aws:bedrock:us-east-1:841162687224:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0",  # Specify the DeepSeek model ID
+            body=json.dumps({
+    "anthropic_version": "bedrock-2023-05-31",
+    "messages": [
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ],
+    "max_tokens": 1024,
+    "temperature": 0.7
+}),
+        )
+
+        
+        # Parse the response
+        response_body = json.loads(response['body'].read().decode('utf-8'))
+        post_text = response_body.get("content", [{}])[0].get("text", "").strip()
+        post_text = re.sub(r'^.*?</think>', '', post_text, flags=re.DOTALL).strip()
+
+        return post_text
+
+    except ClientError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error generating post with Bedrock: {e}"
+        )
+
+
+@app.post("/intent")
+async def detect_intent(prompt: str = Form(...)):
+    intent = await identify_intent_with_gpt(prompt)
+    return {"intent": intent}
+
+@app.post("/chat")
+async def chat_gpt(prompt: str = Form(...)):
+    try:
+        res = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {
-                    "role": "user",
-                    "content": f"Create a LinkedIn post based on this: {content}. Include a CTA and 1-3 hashtags.",
-                },
+                {"role": "system", "content": "You are a helpful assistant for OverOS, focused exclusively on helping users create and post content on LinkedIn. Always respond politely, concisely, and professionally. If a user asks about anything unrelated to LinkedIn posting, gently steer the conversation back with a single respectful sentence that maintains decorum and subtly reminds them of your purpose. respond only in 6 to 7 words."},
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
+            max_tokens=300,
         )
-        print("CHATGPT response received", response.choices[0].message.content.strip())
-        return response.choices[0].message.content.strip()
-
+        
+        # print("{res}")
+        return {"response": res.choices[0].message.content.strip()}
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error generating post with OpenAI: {e}"
-        )
+        return {"error": str(e)}
 
 
-def parse_schedule_to_utc(schedule: str, start_date: datetime) -> List[str]:
-    time_match = re.search(
-        r"(\d{1,2}(?::\d{2})?\s*(AM|PM))\s*(EST|EDT)", schedule, re.IGNORECASE
-    )
-    if not time_match:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid schedule format. Use 'daily at HH:MM AM/PM EST'.",
-        )
-    time_str, am_pm, tz = time_match.groups()
-    est = pytz.timezone("US/Eastern")
-    time_format = "%I:%M %p" if ":" in time_str else "%I %p"
-    time_obj = datetime.strptime(time_str, time_format).time()
-    est_datetime = est.localize(datetime.combine(start_date.date(), time_obj))
-    utc_datetime = est_datetime.astimezone(pytz.UTC)
-    timestamps = []
-    for i in range(10):
-        daily_utc = utc_datetime + timedelta(days=i)
-        timestamps.append(daily_utc.isoformat())
-    return timestamps
-
-
+    
 # --- OAuth Endpoints ---
 @app.get("/", summary="Get LinkedIn Login URL")
 async def get_login_url():
@@ -308,6 +529,38 @@ async def get_login_url():
     auth_url = f"{AUTHORIZATION_BASE_URL}?{urllib.parse.urlencode(params)}"
     return JSONResponse(content={"linkedin_login_url": auth_url})
 
+class GeneratedPost(BaseModel):
+    text: str
+    image_path: Optional[str] = None
+    url: Optional[str] = None
+
+@app.post("/process_intent")
+async def process_intent(prompt: str = Form(...), user_prompt: str = Form(...)):
+    if prompt.lower() != "will deteect intent":
+        raise HTTPException(status_code=400, detail="Invalid prompt. Use 'will deteect intent'.")
+
+    intent = await identify_intent_with_gpt(user_prompt)
+
+    if intent == "linkedin":
+        num_posts, schedule, description, post_text = parse_user_prompt(user_prompt)
+        res = get_cleaned_search_text(user_prompt)
+        if res.get("should_search", False):
+            data = get_news_result(res.get("search_text", ""))
+            link = data.get("link")
+            description = link
+        text = generate_post_content(post_text or description or "Create a post about this topic.")
+        post = {"text": text, "image_path": None, "url": None}
+        return JSONResponse(content={"intent": intent, "generated_post": post})
+
+    elif intent == "linkedin_no_topic":
+        return JSONResponse(content={"intent": intent, "message": "Kindly add a topic."})
+
+    elif intent == "chat":
+        response = await chat_gpt(user_prompt)
+        return JSONResponse(content={"intent": intent, "chat_response": response})
+
+    else:
+        raise HTTPException(status_code=500, detail="Unknown intent detected.")
 
 @app.get("/getID", summary="LinkedIn OAuth Callback - Return user_id")
 async def linkedin_id(code: str, state: str):
@@ -723,9 +976,9 @@ async def smart_post(
     print(num_posts, schedule, description, post_text)
     num_posts = min(num_posts, 10)  # Cap at 10 posts
 
-    # Validate inputs
-    if image_files and len(image_files) > num_posts:
-        raise HTTPException(status_code=400, detail="Too many image files provided.")
+    # # Validate inputs
+    # if image_files and len(image_files) > num_posts:
+    #     raise HTTPException(status_code=400, detail="Too many image files provided.")
     if urls and len(urls) > num_posts:
         raise HTTPException(status_code=400, detail="Too many URLs provided.")
 
@@ -811,7 +1064,196 @@ async def smart_post(
             content={"message": f"{len(results)} posts processed", "results": results},
         )
 
+@app.post("/users/{user_id}/generate_posts", summary="Generate LinkedIn Post Content")
+async def generate_posts(
+    user_id: str,
+    user_prompt: Annotated[
+        str,
+        Form(
+            description="Prompt describing the post(s) and optional schedule (e.g., 'Post this: Hello world! or Create 10 posts for my startup at https://myaisaas.com every day at 9 AM EST')"
+        ),
+    ],
+    image_files: Annotated[
+        Optional[list[UploadFile]],
+        File(description="Optional: List of image files for the posts"),
+    ] = None,
+    urls: Annotated[
+        Optional[list[HttpUrl]],
+        Form(description="Optional: List of URLs to associate with the posts"),
+    ] = None,
+):
+    creds = get_and_validate_creds(user_id)
 
+    # Parse user prompt
+    num_posts, schedule, description, post_text = parse_user_prompt(user_prompt)
+    num_posts = min(num_posts, 10)  # Cap at 10 posts
+
+    # Extract URL from description if present
+    url_from_description = None
+    if description:
+        url_match = re.search(r"https?://[^\s]+", description)
+        if url_match:
+            url_from_description = url_match.group(0)
+            description = description.replace(url_from_description, "").strip()
+
+    # Validate inputs
+    if image_files and len(image_files) > num_posts:
+        raise HTTPException(status_code=400, detail="Too many image files provided.")
+    if urls and len(urls) > num_posts:
+        raise HTTPException(status_code=400, detail="Too many URLs provided.")
+
+    # Generate posts
+    posts = []
+    for i in range(num_posts):
+        # Determine the URL to use: from prompt, input URLs, or None
+        link = None
+        if i == 0 and url_from_description:
+            link = url_from_description
+        elif urls and i < len(urls):
+            link = str(urls[i])
+
+        # Generate text based on description, post_text, or link
+        
+        print(f"Generating post {i + 1}/{num_posts} with link: {link}")
+        text = post_text if i == 0 and post_text else None
+        
+        content = description or "Create a post about this topic."
+        text = generate_post_content(post_text, link)
+
+        image_path = None
+        if image_files and i < len(image_files):
+            image_file = image_files[i]
+            image_path = os.path.join("images", f"{user_id}_{i}_{image_file.filename}")
+            os.makedirs("images", exist_ok=True)
+            with open(image_path, "wb") as f:
+                f.write(await image_file.read())
+
+        post = {
+            "text": text,
+            "image_path": image_path,
+            "url": link,
+        }
+        posts.append(post)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": f"{num_posts} posts generated successfully!",
+            "generated_posts": posts,
+            "schedule": schedule,  # Include schedule in response for reference
+        },
+    )
+
+
+@app.post(
+    "/users/{user_id}/publish_posts",
+    summary="Publish a Single Generated Post to LinkedIn",
+)
+async def publish_posts(
+    user_id: str,
+    post: Annotated[
+        str,
+        Form(
+            description='JSON string of a single generated post to publish or schedule (e.g., \'{"text":"example", "image_path":null, "url":null}\')'
+        ),
+    ],
+    user_prompt: Annotated[
+        str,
+        Form(
+            description="Original prompt used to generate the post (e.g., 'Create a post and schedule it daily at 9 AM EST')"
+        ),
+    ],
+):
+    creds = get_and_validate_creds(user_id)
+
+    # Parse the single post JSON string
+    try:
+        post_dict = json.loads(post)
+        if not isinstance(post_dict, dict):
+            raise ValueError(
+                "Post must be a single object with 'text', 'image_path', and 'url' fields"
+            )
+        validated_post = GeneratedPost(**post_dict).dict()
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid post format: {str(e)}. Expected a JSON string of an object with 'text', 'image_path', and 'url' fields.",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Error validating post: {str(e)}",
+        )
+
+    # Parse the user prompt to determine schedule
+    _, schedule, _, _ = parse_user_prompt(user_prompt)
+
+    if schedule:
+        # Schedule the post
+        timestamp = parse_schedule_to_utc(schedule, datetime.now(pytz.UTC))
+        scheduled_posts = load_scheduled_posts()
+        scheduled_post = {
+            "user_id": user_id,
+            "text": validated_post["text"],
+            "image_path": validated_post["image_path"],
+            "url": validated_post["url"],
+            "timestamp": timestamp,
+        }
+        scheduled_posts.append(scheduled_post)
+        save_scheduled_posts(scheduled_posts)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "Post scheduled successfully!",
+                "scheduled_post": scheduled_post,
+            },
+        )
+    else:
+        # Post immediately
+        try:
+            image_file = None
+            if validated_post["image_path"] and os.path.exists(
+                validated_post["image_path"]
+            ):
+                image_file = UploadFile(
+                    filename=os.path.basename(validated_post["image_path"]),
+                    file=open(validated_post["image_path"], "rb"),
+                )
+            response = await universal_post(
+                user_id=user_id,
+                text=validated_post["text"],
+                image_file=image_file,
+                url=validated_post["url"],
+            )
+            # Extract the JSON body from JSONResponse
+            result = (
+                response.body.decode("utf-8")
+                if isinstance(response, JSONResponse)
+                else response
+            )
+            # Clean up image file after posting
+            if validated_post["image_path"] and os.path.exists(
+                validated_post["image_path"]
+            ):
+                try:
+                    os.remove(validated_post["image_path"])
+                except OSError as e:
+                    print(
+                        f"Error deleting image file {validated_post['image_path']}: {e}"
+                    )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "Post processed",
+                    "result": json.loads(result) if isinstance(result, str) else result,
+                },
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"An unexpected error occurred while processing the post: {e}",
+            )
+            
 @app.delete("/users/{user_id}/posts/{post_urn}", summary="Delete a LinkedIn Post")
 async def delete_post(user_id: str, post_urn: str):
     creds = get_and_validate_creds(user_id)
