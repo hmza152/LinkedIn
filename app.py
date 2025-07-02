@@ -233,6 +233,7 @@ def get_cleaned_search_text(prompt: str) -> dict:
 
     cleaned_text = cleaned_response.choices[0].message.content.strip()
 
+    print("CLEANED RESPONSE: ",cleaned_response)
     return {
         "should_search": True,
         "search_text": cleaned_text
@@ -365,9 +366,14 @@ def generate_post_content(description: str, link: Optional[str] = None, limit_li
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key missing.")
     openai.api_key = OPENAI_API_KEY
-    content = description
+    # content = description
+    
+    print("Generating post content for description:")
     res = get_cleaned_search_text(description)
+    print("Cleaned search text result:")
+    print(res)
     if res.get("should_search", False):
+        print(f"Searching Google for: {res.get('search_text', '')}")
         data = get_news_result(res.get("search_text", ""))
         link = data.get("links")
     if link:
