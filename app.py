@@ -146,10 +146,26 @@ def save_user_credentials(user_id: str, credentials: dict):
         )
 
 
-def get_news_result(q: str):
-    if not SERPAPI_KEY:
-        return {"error": "SerpAPI key is missing or not set in .env file."}
+def get_news_result(q: str, articles_after: str):
 
+    # --- 1. Get API Key ---
+    if not SERPAPI_KEY:
+        print("❌ Error: SERPAPI_KEY environment variable not set.")
+        return {"error": "SERPAPI_KEY not set", "found": False, "links": []}
+
+    # --- 2. Parse the filter date ---
+    try:
+        # The date format from the source seems to include " UTC" which needs to be handled.
+        # We can strip it and parse the rest of the string.
+        cleaned_date_str = articles_after.strip().replace(" UTC", "")
+        # The format string "%m/%d/%Y, %I:%M %p, %z" correctly handles the date, time, AM/PM, and timezone offset.
+        filter_date = datetime.strptime(cleaned_date_str, "%m/%d/%Y, %I:%M %p, %z")
+        print(f"✅ Successfully parsed filter date: {filter_date}")
+    except ValueError as e:
+        print(f"❌ Error: Invalid date format for '{articles_after}'. {e}")
+        return {"error": f"Invalid date format: {e}", "found": False, "links": []}
+
+    # --- 3. Call SerpAPI ---
     params = {
         "engine": "google_news",
         "q": q,
@@ -158,18 +174,55 @@ def get_news_result(q: str):
         "api_key": SERPAPI_KEY
     }
 
-    response = requests.get("https://serpapi.com/search", params=params)
-    data = response.json()
+    print(f"🔍 Searching for '{q}'...")
+    try:
+        response = requests.get("https://serpapi.com/search", params=params)
+        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error during API call: {e}")
+        return {"error": f"API call failed: {e}", "found": False, "links": []}
+    except json.JSONDecodeError:
+        print("❌ Error: Failed to parse JSON from response.")
+        print(f"Raw response text:\n{response.text[:500]}")
+        return {"error": "Failed to parse JSON", "found": False, "links": []}
 
+    # --- 4. Extract and Filter Links ---
     news_results = data.get("news_results", [])
-    if not news_results:
-        return {"found": False, "message": "No news results found."}
+    print(f"📰 Found {len(news_results)} total news results from API.")
 
-    links = [news.get("link") for news in news_results if news.get("link")]
-    return {
+    links = []
+    for news in news_results:
+        date_str = news.get("date")
+        if not date_str:
+            # Skip results that don't have a date
+            continue
+        
+        try:
+            # Clean and parse the date from the news result
+            cleaned_news_date_str = date_str.strip().replace(" UTC", "")
+            news_date = datetime.strptime(cleaned_news_date_str, "%m/%d/%Y, %I:%M %p, %z")
+            
+            # Compare the news article's date with the filter date
+            if news_date > filter_date and news.get("link"):
+                links.append({
+                    "link": news["link"]
+                    # "title": news.get("title", "No Title"),
+                    # "date": news_date.strftime("%Y-%m-%d %H:%M:%S %Z")
+                })
+        except (ValueError, TypeError) as e:
+            # Skip results with a date format that we can't parse
+            print(f"⚠️ Skipping article with unparsable date: '{date_str}' — {e}")
+            continue
+
+    # --- 5. Return Final Result ---
+    result = {
         "found": bool(links),
         "links": links
     }
+    
+    print(f"\n✅ Finished: Found {len(links)} new articles.")
+    return result
 
 
 
@@ -216,27 +269,63 @@ def get_cleaned_search_text(prompt: str) -> dict:
         return {"should_search": False, "search_text": None}
 
     # Step 2: Clean prompt (remove links and irrelevant phrases)
+    now_utc = datetime.utcnow()
+    formatted_now = now_utc.strftime("%m/%d/%Y, %I:%M %p, +0000 UTC")
+
     system_extract = (
-        "You are a helpful assistant. From the user's message, extract only the relevant keywords or search query "
-        "they would type into Google. Ignore any personal references, links, or platform-specific actions like "
-        "'post on LinkedIn'. Return only the cleaned search query."
+        f"""You are a smart assistant that transforms natural language into optimized Google search queries.
+
+        Your task:
+
+        Extract the core search query from the user's message – this should be exactly what they would type into Google.
+
+        Remove personal references, links, or platform-specific actions (e.g., "post on LinkedIn").
+
+        Keep it concise, relevant, and actionable.
+
+        Detect time sensitivity:
+
+        The current time and date is {formatted_now}:
+        If the user’s message mentions a recency requirement (e.g., “last 7 days”, “this month”, “recent”, etc.), convert that to a start_date in this format.
+        'MM/DD/YYYY, HH:MM AM/PM, +0000'.
+
+        Do not include "UTC" or other text.
+
+        Return your output in the following JSON format:
+        {{
+        "search_query": "your optimized search query here",
+        "articles_after": 'MM/DD/YYYY, HH:MM AM/PM, +0000'.  // Only include this key if recency is relevant
+        }}"""
     )
+
     cleaned_response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": system_extract},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=50,
+        max_tokens=100,
         temperature=0.3
     )
 
-    cleaned_text = cleaned_response.choices[0].message.content.strip()
+    content = cleaned_response.choices[0].message.content
+
+    try:
+        json_str = re.search(r'{.*}', content, re.DOTALL).group(0)
+        data = json.loads(json_str)
+    except (AttributeError, json.JSONDecodeError):
+        return {
+            "should_search": True,
+            "search_text": None,
+            "error": "Failed to extract valid JSON from GPT output."
+        }
 
     return {
         "should_search": True,
-        "search_text": cleaned_text
+        "search_text": data.get("search_query"),
+        "articles_after": data.get("articles_after")
     }
+
 
 def load_user_credentials(user_id: str) -> dict | None:
     file_path = os.path.join(TOKEN_STORAGE_DIR, f"{user_id}.json")
@@ -368,7 +457,7 @@ def generate_post_content(description: str, link: Optional[str] = None, limit_li
     content = description
     res = get_cleaned_search_text(description)
     if res.get("should_search", False):
-        data = get_news_result(res.get("search_text", ""))
+        data = get_news_result(res.get("search_text", ""), res['articles_after'])
         link = data.get("links")
     if link:
         fetched_content = []
@@ -545,7 +634,7 @@ async def process_intent(prompt: str = Form(...), user_prompt: str = Form(...)):
         num_posts, schedule, description, post_text = parse_user_prompt(user_prompt)
         res = get_cleaned_search_text(user_prompt)
         if res.get("should_search", False):
-            data = get_news_result(res.get("search_text", ""))
+            data = get_news_result(res.get("search_text", ""),res['articles_after'])
             link = data.get("link")
             description = link
         text = generate_post_content(post_text or description or "Create a post about this topic.")
